@@ -55,16 +55,6 @@ def indices_merged_arr(arr):
     return out
 
 
-# show and prompt user if rotation needs to happen
-# p = pv.Plotter()
-# p.add_volume(resampled_subset)
-# p.add_mesh(mesh.grid, color='white')
-# # p.add_mesh(rotated_mesh, color='blue')
-# p.show_axes()
-# p.view_xy()
-# # p.show_grid()
-# p.show()
-
 class DicomScan(pv.UniformGrid):
 
     def __init__(self, directory):
@@ -85,8 +75,14 @@ class DicomScan(pv.UniformGrid):
 
     def _sorted_dicom_files(self, dicom_dir):
         '''Iterates through dicom files in directory and returns a sorted tuple of file paths by Z'''
+        # from time import perf_counter
+        # start = perf_counter()
         files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient']) for fname in dicom_dir.iterdir())
-        return (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
+        # load_end = perf_counter() - start
+        # sort_start = perf_counter()
+        sorted_files = (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
+        # sort_end = perf_counter() - sort_start
+        return sorted_files
 
     def read_xyzhu_from_dcm(self, dicom_dir, skip_scouts=False):
         '''Reads dicom xyz, HU, and other parameters into class. Origin'''
@@ -164,9 +160,69 @@ class FeaMesh(pv.UnstructuredGrid):
         self.ct_spacing = dicom_data.spacing
         self.ct_bounds = dicom_data.bounds
         self.params = params
-        self._interpolate_modulus()
+        if self.params['integration']['method'] == 'E':
+            self._interpolate_modulus()
+        elif self.params['integration']['method'] == 'HU':
+            self._interpolate_hu()
+        else:
+            raise ValueError('Integration method has to be either E or HU')
         self._refine_materials()
         self.poisson = params['CT_Calibration']['poisson']
+
+    def _interpolate_hu(self):
+        """
+        This function uses trilinear interpolation on shape function generated coordinates to assign a HU to
+        each element.
+        :return:
+        """
+        step = 1.0 / self.params['integration']['steps']
+        # establish natural coordinates
+        perfect_natural_coord, shape_fx_values = self._get_natural_coordinates(step)
+        # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
+        # pv._vtk.VTK_QUADRATIC_TETRA
+        # todo adapt to multiple input element shapes
+        # using numexpr to evaluate dynamically built string expressions on arrays.
+        HU = self.hu
+        # HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
+        #                25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
+        shaped_hu = HU.reshape(self.ct_data.dimensions, order='F')
+        x, y, z = [np.arange(self.ct_bounds[2 * idx], self.ct_bounds[2 * idx + 1] + step, step) for idx, step in
+                   enumerate(self.ct_spacing)]
+        # shaped_modulus = modulus.reshape([3, 3, 3])
+        #  test_coords = [-1, 0, 1]
+        #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
+        ct_interp = RegularGridInterpolator((x, y, z), shaped_hu)
+        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:][:, np.newaxis, ...]
+        # find co-ordinate for each iteration using shape functions
+        # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
+        #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
+        # test_moduli = np.array([0.3253933519291822, 0.46225376439520105, 0.6140291170289474, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.9570775611694978, 1.1464347387199867, 1.3466993724191563])
+        # test_moduli = test_moduli.reshape([3, 3, 3])
+        # interpn(([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]), test_moduli, interpolation_coordinates)
+        # interpolation_coordinates_arr = np.sum(elem_pts_arr * shape_fx_values, axis=2)
+        interpolation_coordinates_arr = ne.evaluate("sum(elem_pts_arr * shape_fx_values, axis=2)")
+        # for each co-ordinate, interpolate ct value
+        interp_result = ct_interp(interpolation_coordinates_arr)
+        n_naturals = perfect_natural_coord.shape[0]
+        interpolated_hu = ne.evaluate("sum(interp_result/ n_naturals, axis=1)")
+        # calculate modulus from hu
+        rho_qct_fx_HU_str = ' + '.join(
+            [f'{coef}*(HU**{idx})' for idx, coef in enumerate(self.params['CT_Calibration']['ct_coefs'])])
+        rho = ne.evaluate(rho_qct_fx_HU_str, local_dict={'HU':interpolated_hu})
+        if self.params['CT_Calibration']['apply_ash_correction']:
+            rho_ash_fx_RQCT_str = ' + '.join([f'{coef}*(rho**{idx})' for idx, coef in
+                                              enumerate(self.params['CT_Calibration']['ash_correction_coefs'])])
+            rho = ne.evaluate(rho_ash_fx_RQCT_str)
+        modulus_coefs = self.params['CT_Calibration']['modulus_coefs']
+        modulus_fx_RHO_str = f'{modulus_coefs[0]}+{modulus_coefs[1]}*rho**{self.params["CT_Calibration"]["modulus_exponent"]}'
+        min_density = self.params['CT_Calibration']['min_rho']
+        rho = ne.evaluate(
+            "where(rho<=min_density, min_density, rho)")  # eliminate any negative densities for full dicom array
+        calculated_modulus = ne.evaluate(modulus_fx_RHO_str)
+        if self.params['integration']['apply_elasticity_bounds']:
+            calculated_modulus = np.clip(calculated_modulus, float(self.params['CT_Calibration']['min_modulus_value']),
+                              float(self.params['CT_Calibration']['max_modulus_value']))
+        self.interpolated_moduli = calculated_modulus
 
     def _interpolate_modulus(self):
         """
@@ -202,7 +258,7 @@ class FeaMesh(pv.UnstructuredGrid):
                               float(self.params['CT_Calibration']['max_modulus_value']))
         x, y, z = [np.arange(self.ct_bounds[2 * idx], self.ct_bounds[2 * idx + 1] + step, step) for idx, step in
                    enumerate(self.ct_spacing)]
-        shaped_modulus = modulus.reshape(self.ct_data.dimensions)
+        shaped_modulus = modulus.reshape(self.ct_data.dimensions, order='F')
         # shaped_modulus = modulus.reshape([3, 3, 3])
         #  test_coords = [-1, 0, 1]
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
@@ -224,6 +280,8 @@ class FeaMesh(pv.UnstructuredGrid):
         self.interpolated_moduli = ne.evaluate("sum(interp_result/ n_naturals, axis=1)")
 
     def _bin_modulus(self):
+        '''This functions creates and bins material properties based on passed parameters to reduce the number of
+        materials created by the mapping process. '''
         min_E = float(self.params['CT_Calibration']['min_modulus_value'])
         max_E = float(self.params['CT_Calibration']['max_modulus_value'])
         max_E = max_E if max_E < self.interpolated_moduli.max() else self.interpolated_moduli.max()
@@ -244,9 +302,24 @@ class FeaMesh(pv.UnstructuredGrid):
         self.n_materials = len(used_bins)
 
     def _backcalculate_density(self):
+        '''This function calculates the density from the assigned modulus by reversing the passed relationship
+        between modulus and density '''
         modulus_coefs = self.params['CT_Calibration']['modulus_coefs']
-        self.binned_density = np.float_power((self.binned_moduli - modulus_coefs[0]) / modulus_coefs[1],
-                                             1 / self.params['CT_Calibration']['modulus_exponent'])
+        rho_ash = ne.evaluate('((mod-coef0)/coef1)**(1/mod_exp)',
+                                          local_dict={'mod':self.binned_moduli,
+                                                      'coef0':modulus_coefs[0],
+                                                      'coef1':modulus_coefs[1],
+                                                      'mod_exp':self.params['CT_Calibration']['modulus_exponent']})
+        if self.params['CT_Calibration']['output_rho_qct']:
+            # reverse rho_ash_correction
+            ash_coefs = self.params['CT_Calibration']['ash_correction_coefs']
+            rho_qct_fx_RASH_str = f'(rho_ash - {ash_coefs[0]})/{ash_coefs[1]}'
+            self.binned_density = ne.evaluate(rho_qct_fx_RASH_str)
+        else:
+            self.binned_density = rho_ash
+        self.binned_density = np.clip(self.binned_density, self.params['CT_Calibration']['min_rho'], self.binned_density.max())
+
+
 
     def _refine_materials(self):
         """This function uses preset parameters to group materials in bins, based on modulus gap value. Without this
@@ -256,6 +329,7 @@ class FeaMesh(pv.UnstructuredGrid):
 
     @staticmethod
     def _get_natural_coordinates(step):
+        """Method to create natural coordinates for a TET10 element"""
         natural_coords = np.zeros((10, 4))
         shape_values = np.zeros((10, 10, 1))
         count = 0
@@ -284,6 +358,8 @@ class FeaMesh(pv.UnstructuredGrid):
 
 
 def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
+    """This function writes the passed mesh to ansys .inp format at the given file_path location. Currently assumes a
+    TET10 mesh """
     assert file_path.suffix == '.inp', 'File suffix has to be .inp'
     # spacing is 13 spaces
     sep = ' ' * 13
@@ -343,21 +419,18 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
 
 
 if __name__ == '__main__':
-    from time import perf_counter
 
-    start = perf_counter()
-    folder = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper')
-    tetmesh_cdb_file = folder / '0408_S5.cdb'
-    dicom_dir = folder / '0408_s5'
+    # load data and parameters in
+    tetmesh_cdb_file = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
+    dicom_dir = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'
+    # params_yaml_file = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / 'params.yaml'
     params_yaml_file = Path('params.yaml')
-    output_tetmesh = folder / (tetmesh_cdb_file.stem + '_MM.inp')
+    output_tetmesh = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (tetmesh_cdb_file.stem + '_MM.inp')
     with open(params_yaml_file) as f:
         parameters = yaml.safe_load(f)
 
     # dicom_data = load_dicom_file(dicom_dir)
-    dicom_data = DicomScan(dicom_dir)  # no SliceLocation param in any
-
+    dicom_data = DicomScan(dicom_dir)
     tetmesh = load_cdb_archive(str(tetmesh_cdb_file))
     mesh = FeaMesh(tetmesh.grid, dicom_data, parameters)
     write_ansys_inp_file(mesh, output_tetmesh)
-    print(f'Finished in : {perf_counter() - start} seconds')
