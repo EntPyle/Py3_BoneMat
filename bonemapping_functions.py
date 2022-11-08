@@ -5,6 +5,9 @@ from trimesh.transformations import rotation_matrix
 import numpy as np
 from loguru import logger
 import numexpr as ne
+
+ne.set_num_threads(8)
+ne.use_vml = True
 from scipy.interpolate import RegularGridInterpolator
 from tqdm import tqdm
 import pydicom
@@ -50,6 +53,8 @@ def indices_merged_arr(arr):
     out.shape = (-1, n + 1)
     # out[:, :2] = out[:, (1, 0)]
     return out
+
+
 # show and prompt user if rotation needs to happen
 # p = pv.Plotter()
 # p.add_volume(resampled_subset)
@@ -137,8 +142,9 @@ class DicomScan(pv.UniformGrid):
             grid_to_xyz[:-1, -1] = slice_origin
             if i == 0:
                 self.origin = slice_origin
-            slice_hu_data = indices_merged_arr(
-                img2d * self.rescale_slope + self.rescale_int)  # x_idx, y_idx, HU
+            slice_hu_data = indices_merged_arr(ne.evaluate("img * slope + intercept",
+                                                           local_dict={'img': img2d, 'slope': self.rescale_slope,
+                                                                       'intercept': self.rescale_int}))  # x_idx, y_idx, HU
             xyz_one = grid_to_xyz @ np.vstack((slice_hu_data[:, :-1].T, zero_row, one_row))
             xyz_one[-1, :] = slice_hu_data[:, -1]
             # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + slice_origin[:-1]
@@ -201,52 +207,21 @@ class FeaMesh(pv.UnstructuredGrid):
         #  test_coords = [-1, 0, 1]
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
         ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus)
-        # initialize parameters for looping
-        # nc4 = perfect_natural_coord.T * 4
-        # n_naturals = len(perfect_natural_coord)
-        # nc_J = np.zeros((4, 4, n_naturals))
-        # nc_J[0] = nc4 - 1
-        # nc_J[1] = nc4[[1, 0, 1, 0]]
-        # nc_J[2] = nc4[[2, 2, 0, 1]]
-        # nc_J[3] = nc4[[3, 3, 3, 2]]
-        # nc_P = np.zeros((4, 4, 3))
-        #
-        # jacobians = np.ones((10, 4, 4))
-        # self.interpolated_moduli = np.zeros_like(self.get_array('vtkOriginalCellIds'), dtype=np.float64)
 
         # todo I think I can get rid of this for loop
-        # mesh.cells.reshape(-1, 11)  # get's array of node indices per element.
-        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:]
-        interpolation_coordinates_arr = np.sum(elem_pts_arr[:, np.newaxis, ...] * shape_fx_values, axis=2)
-        self.interpolated_moduli = np.sum(ct_interp(interpolation_coordinates_arr) / perfect_natural_coord.shape[0], axis=1)
-        # for idx, elem_id in tqdm(enumerate(self.get_array('vtkOriginalCellIds')), total=self.interpolated_moduli.size,
-        #                          desc='Mapping CT Data onto Tetmesh'):  # iterate thru element ids
-        #     elem_pts = self.cell_points(elem_id)
-        #
-        #     # elem_pts = np.array([[-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
-        #     # get jacobians at all naturals for this element
-        #     # nc_P[0] = elem_pts[:4]
-        #     # nc_P[1] = elem_pts[[4, 4, 5, 7]]
-        #     # nc_P[2] = elem_pts[[6, 5, 6, 8]]
-        #     # nc_P[3] = elem_pts[[7, 8, 9, 9]]
-        #
-        #     # jacobians[:, 1:, :] = np.einsum('jec,jen->nce', nc_P, nc_J)
-        #     # det_jacobians = np.linalg.det(jacobians)
-        #
-        #     # estimate volume of element from jacobians
-        #     # volume = det_jacobians.sum() / 6
-        #     # find co-ordinate for each iteration using shape functions
-        #     # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
-        #     #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
-        #     # test_moduli = np.array([0.3253933519291822, 0.46225376439520105, 0.6140291170289474, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.9570775611694978, 1.1464347387199867, 1.3466993724191563])
-        #     # test_moduli = test_moduli.reshape([3, 3, 3])
-        #     # interpn(([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]), test_moduli, interpolation_coordinates)
-        #     interpolation_coordinates = np.sum(elem_pts * shape_fx_values, axis=1)
-        #
-        #     # for each co-ordinate, interpolate moduli
-        #     # self.interpolated_moduli[idx] = np.sum(det_jacobians*ct_interp(interpolation_coordinates)/6) / volume
-        #     self.interpolated_moduli[idx] = np.sum(
-        #         ct_interp(interpolation_coordinates) / perfect_natural_coord.shape[0])
+        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:][:, np.newaxis, ...]
+        # find co-ordinate for each iteration using shape functions
+        # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
+        #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
+        # test_moduli = np.array([0.3253933519291822, 0.46225376439520105, 0.6140291170289474, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.9570775611694978, 1.1464347387199867, 1.3466993724191563])
+        # test_moduli = test_moduli.reshape([3, 3, 3])
+        # interpn(([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]), test_moduli, interpolation_coordinates)
+        # interpolation_coordinates_arr = np.sum(elem_pts_arr * shape_fx_values, axis=2)
+        interpolation_coordinates_arr = ne.evaluate("sum(elem_pts_arr * shape_fx_values, axis=2)")
+        # for each co-ordinate, interpolate moduli
+        interp_result = ct_interp(interpolation_coordinates_arr)
+        n_naturals = perfect_natural_coord.shape[0]
+        self.interpolated_moduli = ne.evaluate("sum(interp_result/ n_naturals, axis=1)")
 
     def _bin_modulus(self):
         min_E = float(self.params['CT_Calibration']['min_modulus_value'])
@@ -369,6 +344,7 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
 
 if __name__ == '__main__':
     from time import perf_counter
+
     start = perf_counter()
     folder = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper')
     tetmesh_cdb_file = folder / '0408_S5.cdb'
