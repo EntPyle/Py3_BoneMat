@@ -1,15 +1,18 @@
 from pathlib import Path
 from ansys.mapdl import reader as pymapdl_reader
 import pyvista as pv
-from pyvistaqt import BackgroundPlotter
 from trimesh.transformations import rotation_matrix
 import numpy as np
 from loguru import logger
 import numexpr as ne
-from scipy.spatial import cKDTree
 from scipy.interpolate import RegularGridInterpolator
-
-#
+from tqdm import tqdm
+import pydicom
+import operator
+from functools import reduce
+import yaml
+from datetime import datetime
+from itertools import chain, repeat
 
 
 def load_cdb_archive(cdb_filepath):
@@ -17,17 +20,12 @@ def load_cdb_archive(cdb_filepath):
     return pymapdl_reader.Archive(cdb_filepath, read_parameters=True)
 
 
-def load_dicom_file(dicom_directory):
-    reader = pv.DICOMReader(dicom_directory)
-    return reader.read()
-
-
 def downsample_dicom_volume(large_dicom, resampled_grid_size=(50, 50, 100), do_threshold=True, threshold_value=500):
     '''Useful to create a downsampled dicom grid for faster viewing.'''
     if do_threshold:
         logger.debug(f'Thresholding dicom with value of {threshold_value}')
         # clip data using threshold to remove uninteresting data.
-        clipped = large_dicom.clip_scalar(scalars="DICOMImage", value=threshold_value, invert=False)
+        clipped = large_dicom.clip_scalar(scalars="HU", value=threshold_value, invert=False)
         # create downsampled grid
         logger.debug('Downsampling dicom')
         subset = pv.create_grid(clipped, dimensions=resampled_grid_size)
@@ -42,6 +40,16 @@ def rotate_pyvista_grid(grid, angle=180, rotation_axis=(0, 0, 1)):
     return grid.transform(rot_matrix, inplace=False)
 
 
+def indices_merged_arr(arr):
+    n = arr.ndim
+    grid = np.ogrid[tuple(map(slice, arr.shape))]
+    out = np.empty(arr.shape + (n + 1,), dtype=arr.dtype)
+    for i in range(n):
+        out[..., i] = grid[i]
+    out[..., -1] = arr
+    out.shape = (-1, n + 1)
+    # out[:, :2] = out[:, (1, 0)]
+    return out
 # show and prompt user if rotation needs to happen
 # p = pv.Plotter()
 # p.add_volume(resampled_subset)
@@ -52,62 +60,224 @@ def rotate_pyvista_grid(grid, angle=180, rotation_axis=(0, 0, 1)):
 # # p.show_grid()
 # p.show()
 
+class DicomScan(pv.UniformGrid):
+
+    def __init__(self, directory):
+        self.voxel_size = None
+        self.rescale_int = None
+        self.rescale_slope = None
+        self.row_cosine = None
+        self.slice_thickness = None
+        self.slice_increment = None
+        self.pixel_spacing = None
+        self.hu_data = None
+        self.grid_shape = None
+        self.col_cosine = None
+        self.read_xyzhu_from_dcm(directory, False)
+        grid = pv.UniformGrid(dims=self.grid_shape, origin=self.origin, spacing=self.voxel_size)
+        grid.point_data['HU'] = self.hu_data[:, -1]
+        super(DicomScan, self).__init__(grid)
+
+    def _sorted_dicom_files(self, dicom_dir):
+        '''Iterates through dicom files in directory and returns a sorted tuple of file paths by Z'''
+        files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient']) for fname in dicom_dir.iterdir())
+        return (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
+
+    def read_xyzhu_from_dcm(self, dicom_dir, skip_scouts=False):
+        '''Reads dicom xyz, HU, and other parameters into class. Origin'''
+        files = (pydicom.dcmread(file) for file in self._sorted_dicom_files(dicom_dir))
+
+        if skip_scouts:
+            # skip files with no SliceLocation (eg scout views)
+            slices = []
+            skipcount = 0
+            for f in files:
+                if hasattr(f, 'SliceLocation'):
+                    slices.append(f)
+                else:
+                    skipcount += 1
+
+            print("skipped, no SliceLocation: {}".format(skipcount))
+
+            # ensure remaining are in the correct order
+            slices = sorted(slices, key=lambda s: s.SliceLocation)
+        else:
+            slices = tuple(files)
+
+        # create 3D array
+        img_shape = list(slices[0].pixel_array.shape)
+        img_shape.append(len(slices))
+        self.grid_shape = img_shape
+        self.hu_data = np.zeros((reduce(operator.mul, img_shape), 4))
+
+        # fill 2D array with the image data from the files
+        self.pixel_spacing = np.array(slices[0].PixelSpacing, dtype=float)  # center-center distance of pixels
+        slice_increment_set = {slices[i + 1].ImagePositionPatient[2] - s.ImagePositionPatient[2] for i, s in
+                               enumerate(slices[:-1])}
+        # todo consider raising a warning unequally spaced data
+        self.slice_increment = tuple(slice_increment_set)[0] if len(slice_increment_set) == 1 else \
+            slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2]
+        self.slice_thickness = np.array(slices[0].SliceThickness, dtype=float)  # center-center distance of pixels
+        self.row_cosine = np.array(slices[0].ImageOrientationPatient[:3], dtype=float)
+        self.col_cosine = np.array(slices[0].ImageOrientationPatient[-3:], dtype=float)
+        self.rescale_slope = float(slices[0].RescaleSlope)
+        self.rescale_int = float(slices[0].RescaleIntercept)
+        grid_to_xyz = np.zeros((4, 4))
+        grid_to_xyz[-1, -1] = 1
+        grid_to_xyz[:-1, 0] = self.row_cosine * self.pixel_spacing[0]
+        grid_to_xyz[:-1, 1] = self.col_cosine * self.pixel_spacing[1]
+
+        idx_vector = np.array([0, 0, 0, 1]).reshape(-1, 1)
+        zero_row = np.r_[[0] * img_shape[0] ** 2]
+        one_row = np.r_[[1] * img_shape[0] ** 2]
+
+        for i, s in tqdm(enumerate(slices), desc='Pulling xyz and HU data', total=len(slices)):
+            img2d = s.pixel_array
+            slice_origin = np.array(s.ImagePositionPatient, dtype=float)  # Top left corner
+            grid_to_xyz[:-1, -1] = slice_origin
+            if i == 0:
+                self.origin = slice_origin
+            slice_hu_data = indices_merged_arr(
+                img2d * self.rescale_slope + self.rescale_int)  # x_idx, y_idx, HU
+            xyz_one = grid_to_xyz @ np.vstack((slice_hu_data[:, :-1].T, zero_row, one_row))
+            xyz_one[-1, :] = slice_hu_data[:, -1]
+            # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + slice_origin[:-1]
+            self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one.T
+
+        # hu_df = vaex.from_arrays(x=hu_data[:, 0], y=hu_data[:, 1], z=hu_data[:, 2], HU=hu_data[:, 3])
+        # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
+        self.voxel_size = np.array([*self.pixel_spacing, self.slice_increment])
+
 
 class FeaMesh(pv.UnstructuredGrid):
 
-    def __init__(self, grid: pv.UnstructuredGrid, dicom_data: pv.UniformGrid):
+    def __init__(self, grid: pv.UnstructuredGrid, dicom_data: pv.UniformGrid, params: dict):
         super(FeaMesh, self).__init__(grid)
         self.ct_data = dicom_data
-        self.hu = dicom_data.get_array('DICOMImage')
-        self.shaped_hu = self.hu.reshape(dicom_data.dimensions)
+        self.hu = dicom_data.get_array('HU')
         self.ct_spacing = dicom_data.spacing
         self.ct_bounds = dicom_data.bounds
+        self.params = params
+        self._interpolate_modulus()
+        self._refine_materials()
+        self.poisson = params['CT_Calibration']['poisson']
 
-    def _assign_material_properties(self, n_integration_steps, rho_qct_fx, rho_ash_fx, modulus_fx):
-        step = 1.0 / n_integration_steps
+    def _interpolate_modulus(self):
+        """
+        This function uses trilinear interpolation on shape function generated coordinates to assign a modulus to
+        each element.
+        :return:
+        """
+        step = 1.0 / self.params['integration']['steps']
         # establish natural coordinates
         perfect_natural_coord, shape_fx_values = self._get_natural_coordinates(step)
         # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
         # pv._vtk.VTK_QUADRATIC_TETRA
-        # todo calculate modulus/density from shaped_hu using passed equations/params
-        shaped_modulus = self.shaped_hu * 17
+        # todo adapt to multiple input element shapes
+        # using numexpr to evaluate dynamically built string expressions on arrays.
+        HU = self.hu
+        # HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
+        #                25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
+        rho_qct_fx_HU_str = ' + '.join(
+            [f'{coef}*(HU**{idx})' for idx, coef in enumerate(self.params['CT_Calibration']['ct_coefs'])])
+        rho = ne.evaluate(rho_qct_fx_HU_str)
+        if self.params['CT_Calibration']['apply_ash_correction']:
+            rho_ash_fx_RQCT_str = ' + '.join([f'{coef}*(rho**{idx})' for idx, coef in
+                                              enumerate(self.params['CT_Calibration']['ash_correction_coefs'])])
+            rho = ne.evaluate(rho_ash_fx_RQCT_str)
+        modulus_coefs = self.params['CT_Calibration']['modulus_coefs']
+        modulus_fx_RHO_str = f'{modulus_coefs[0]}+{modulus_coefs[1]}*rho**{self.params["CT_Calibration"]["modulus_exponent"]}'
+        min_density = self.params['CT_Calibration']['min_rho']
+        rho = ne.evaluate(
+            "where(rho<=min_density, min_density, rho)")  # eliminate any negative densities for full dicom array
+        modulus = ne.evaluate(modulus_fx_RHO_str)
+        if self.params['integration']['apply_elasticity_bounds']:
+            modulus = np.clip(modulus, float(self.params['CT_Calibration']['min_modulus_value']),
+                              float(self.params['CT_Calibration']['max_modulus_value']))
+        x, y, z = [np.arange(self.ct_bounds[2 * idx], self.ct_bounds[2 * idx + 1] + step, step) for idx, step in
+                   enumerate(self.ct_spacing)]
+        shaped_modulus = modulus.reshape(self.ct_data.dimensions)
+        # shaped_modulus = modulus.reshape([3, 3, 3])
+        #  test_coords = [-1, 0, 1]
+        #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
+        ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus)
+        # initialize parameters for looping
+        # nc4 = perfect_natural_coord.T * 4
+        # n_naturals = len(perfect_natural_coord)
+        # nc_J = np.zeros((4, 4, n_naturals))
+        # nc_J[0] = nc4 - 1
+        # nc_J[1] = nc4[[1, 0, 1, 0]]
+        # nc_J[2] = nc4[[2, 2, 0, 1]]
+        # nc_J[3] = nc4[[3, 3, 3, 2]]
+        # nc_P = np.zeros((4, 4, 3))
+        #
+        # jacobians = np.ones((10, 4, 4))
+        # self.interpolated_moduli = np.zeros_like(self.get_array('vtkOriginalCellIds'), dtype=np.float64)
 
-        for elem_id in self.get_array('ansys_elem_num'):  # iterate thru element ids
-            elem_pts = self.cell_points(elem_id)
-            jacobian = np.ones((4, 4))
-            nc4 = perfect_natural_coord.T*4
-            n_naturals = len(perfect_natural_coord)
-            # get jacobians at all naturals for this element
-            nc_J = np.zeros((4, 4, n_naturals))
+        # todo I think I can get rid of this for loop
+        # mesh.cells.reshape(-1, 11)  # get's array of node indices per element.
+        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:]
+        interpolation_coordinates_arr = np.sum(elem_pts_arr[:, np.newaxis, ...] * shape_fx_values, axis=2)
+        self.interpolated_moduli = np.sum(ct_interp(interpolation_coordinates_arr) / perfect_natural_coord.shape[0], axis=1)
+        # for idx, elem_id in tqdm(enumerate(self.get_array('vtkOriginalCellIds')), total=self.interpolated_moduli.size,
+        #                          desc='Mapping CT Data onto Tetmesh'):  # iterate thru element ids
+        #     elem_pts = self.cell_points(elem_id)
+        #
+        #     # elem_pts = np.array([[-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+        #     # get jacobians at all naturals for this element
+        #     # nc_P[0] = elem_pts[:4]
+        #     # nc_P[1] = elem_pts[[4, 4, 5, 7]]
+        #     # nc_P[2] = elem_pts[[6, 5, 6, 8]]
+        #     # nc_P[3] = elem_pts[[7, 8, 9, 9]]
+        #
+        #     # jacobians[:, 1:, :] = np.einsum('jec,jen->nce', nc_P, nc_J)
+        #     # det_jacobians = np.linalg.det(jacobians)
+        #
+        #     # estimate volume of element from jacobians
+        #     # volume = det_jacobians.sum() / 6
+        #     # find co-ordinate for each iteration using shape functions
+        #     # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
+        #     #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
+        #     # test_moduli = np.array([0.3253933519291822, 0.46225376439520105, 0.6140291170289474, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.46225376439520105, 0.6140291170289474, 0.7793257648849838, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.6140291170289474, 0.7793257648849838, 0.9570775611694978, 0.7793257648849838, 0.9570775611694978, 1.1464347387199867, 0.9570775611694978, 1.1464347387199867, 1.3466993724191563])
+        #     # test_moduli = test_moduli.reshape([3, 3, 3])
+        #     # interpn(([-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]), test_moduli, interpolation_coordinates)
+        #     interpolation_coordinates = np.sum(elem_pts * shape_fx_values, axis=1)
+        #
+        #     # for each co-ordinate, interpolate moduli
+        #     # self.interpolated_moduli[idx] = np.sum(det_jacobians*ct_interp(interpolation_coordinates)/6) / volume
+        #     self.interpolated_moduli[idx] = np.sum(
+        #         ct_interp(interpolation_coordinates) / perfect_natural_coord.shape[0])
 
-            nc_J[0] = nc4 - 1
-            nc_J[1] = nc4[[1, 0, 1, 0]]
-            nc_J[2] = nc4[[2, 2, 0, 1]]
-            nc_J[3] = nc4[[3, 3, 3, 2]]
-            nc_P = np.zeros((4, 4, 3))
-            nc_P[0] = elem_pts[:4]
-            nc_P[1] = elem_pts[[4, 4, 5, 7]]
-            nc_P[2] = elem_pts[[6, 5, 6, 8]]
-            nc_P[3] = elem_pts[[7, 8, 9, 9]]
+    def _bin_modulus(self):
+        min_E = float(self.params['CT_Calibration']['min_modulus_value'])
+        max_E = float(self.params['CT_Calibration']['max_modulus_value'])
+        max_E = max_E if max_E < self.interpolated_moduli.max() else self.interpolated_moduli.max()
+        E_bin_size = self.params['CT_Calibration']['modulus_bin_size']
+        E_bin_method = self.params['CT_Calibration']['modulus_bin_grouping_method']
+        possible_bins = np.arange(max_E, min_E - E_bin_size, -E_bin_size)
+        assigned_bins = possible_bins[np.digitize(self.interpolated_moduli, possible_bins)]
+        used_bins = possible_bins[np.in1d(possible_bins, assigned_bins)]
+        self.binned_moduli = np.zeros_like(used_bins)
+        self.material_mapping = list()
+        for idx, bin_edge in enumerate(used_bins):
+            # find elements in this material bin
+            element_indices = np.where(assigned_bins == bin_edge)[0]
+            bin_moduli = self.interpolated_moduli[element_indices]
+            self.material_mapping.append(element_indices)
+            self.binned_moduli[idx] = bin_moduli.max() if E_bin_method == 'max' else bin_moduli.mean()
 
-            jacobians = np.ones((10, 4, 4))
-            jacobians[:,1:, :] = np.einsum('jec,jen->nce', nc_P, nc_J)
-            det_jacobians = np.linalg.det(jacobians)
+        self.n_materials = len(used_bins)
 
-            # estimate volume of element from jacobians
-            volume = det_jacobians.sum()/6/n_naturals
-            # find co-ordinate for each iteration using shape functions
-            interpolation_coordinates = np.sum(elem_pts*shape_fx_values, axis=1)
+    def _backcalculate_density(self):
+        modulus_coefs = self.params['CT_Calibration']['modulus_coefs']
+        self.binned_density = np.float_power((self.binned_moduli - modulus_coefs[0]) / modulus_coefs[1],
+                                             1 / self.params['CT_Calibration']['modulus_exponent'])
 
-            x, y, z = [np.arange(self.ct_bounds[2 * idx], self.ct_bounds[2 * idx + 1] + step, step) for idx, step in
-                       enumerate(self.ct_spacing)]
-            self.ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus)
-            # for each co-ordinate find CT co-ordinate
-            interpolated_ct_data = self.ct_interp(interpolation_coordinates)
-            # todo integrate function?
-            # todo trilinear interpolation in dicom using RegularGridInterpolate or interpn from scipy.interpolate
-            # UniformGrid.find_containing_cell()
-
+    def _refine_materials(self):
+        """This function uses preset parameters to group materials in bins, based on modulus gap value. Without this
+        all elements would have independent material properties """
+        self._bin_modulus()
+        self._backcalculate_density()
 
     @staticmethod
     def _get_natural_coordinates(step):
@@ -137,49 +307,81 @@ class FeaMesh(pv.UnstructuredGrid):
 
         # l, r, s, t, w could all be calculated once ahead of time.
 
-    # todo assign_material_properties(self, dicom_mesh). Easier with numexpr/numba, I think
 
-    # todo interpolate scalar in the tet mesh
-    # todo build NN tree for CT data.
-    # todo _refine/bin material properties
-
-
-# todo define_material_equations from params
-
-def write_ansys_inp_file():
+def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
+    assert file_path.suffix == '.inp', 'File suffix has to be .inp'
     # spacing is 13 spaces
-    # todo Header
-    # todo Nodes (N,node_id,             x_coord,             y_coord,             z_coord
-
-    # todo material
+    sep = ' ' * 13
+    # Header
+    header_lines = (r'/TITLE,',
+                    fr'/COM, Generated By Python {str(datetime.now())}',
+                    r'/PREP7',
+                    '')
+    # Nodes (N,node_id,             x_coord,             y_coord,             z_coord
+    nd_ids = mesh.get_array('ansys_node_num')
+    node_str_gen = (f"N,{nd_id},{sep}{nd_coord[0]},{sep}{nd_coord[1]},{sep}{nd_coord[2]}" for
+                    nd_id, nd_coord in zip(nd_ids, mesh.points.round(6)))
+    moduli_str = (fr"MP,EX,{mat_idx + 1},{sep}{ex}" for mat_idx, ex in enumerate(mesh.binned_moduli.round(8)))
+    poisson_str = (fr"MP,NUXY,{mat_idx + 1},{sep}{nuxy}" for mat_idx, nuxy in
+                   enumerate(repeat(mesh.poisson, mesh.binned_moduli.shape[0])))
+    dens_str = (fr"MP,DENS,{mat_idx + 1},{sep}{dens}" for mat_idx, dens in enumerate(mesh.binned_density.round(8)))
+    skipline = repeat('', mesh.binned_moduli.shape[0])
+    matr_str_gen = (entry for material_block in zip(moduli_str, poisson_str, dens_str, skipline) for entry in
+                    material_block)
     # MP,EX,mat_id,             22842.01821243
     # MP,NUXY,mat_id,             0.30000000
     # MP,DENS,mat_id,             1.44491135
 
-    # ET,2,187 # todo element type
+    # ET,2,187 # element type
+    element_type_entry = ('', '', 'ET,2,187')
+    # element node and material mapping
+    elem_ids = mesh.get_array('vtkOriginalCellIds')
+    element_nodes_data = list()
+    for mat_idx, element_set in enumerate(mesh.material_mapping):
+        element_nodes_data.append('')
+        element_nodes_data.append(f'TYPE, 2 $ MAT, {mat_idx + 1} $ REAL, 0')
+        for elem_idx in element_set:
+            el_id = elem_ids[elem_idx]
+            element_nodes_data.append(
+                f'EN,{sep}{el_id},{sep}{("," + sep).join(map(str, nd_ids[mesh.cell_point_ids(el_id)[:-2]]))}')
+            element_nodes_data.append(
+                f'EMORE,{sep}{("," + sep).join(map(str, nd_ids[mesh.cell_point_ids(el_id)[-2:]]))}')
+        element_nodes_data.append(f'CM, TYPE2-REAL0-MAT{mat_idx + 1}, ELEM')
 
     # TYPE, 2 $ MAT, mat_id $ REAL, 0  # element type ptr? material id.
     # EN,             72201,             13409,             652,             4740,             5219,             30600,             30596,             59516,             61769 # node ids
     # EMORE,             30597,              59514 # more node ids
-    # CM, TYPE2 - REAL0 - MAT1, ELEM  # element block (part?) name
-    # todo footer
-
+    # CM, TYPE2-REAL0-MAT1, ELEM  # element block (part?) name
+    footer_lines = ('',
+                    '',
+                    'ESEL, ALL',
+                    '',
+                    'FINISH')
     # ESEL, ALL
 
     # FINISH
 
-    pass
+    write_content = chain(header_lines, node_str_gen, [''], matr_str_gen, element_type_entry, element_nodes_data,
+                          footer_lines)
+    with open(file_path, 'w') as f:
+        f.write('\n'.join(write_content))
 
 
-# todo save to .inp file.
 if __name__ == '__main__':
+    from time import perf_counter
+    start = perf_counter()
     folder = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper')
-    filename = str(folder / '0408_S5.cdb')
-    dicom_dir = folder / 's5'
-    file_path = folder / '0408_S5_wmm_FEMAP_ABQ.inp'
+    tetmesh_cdb_file = folder / '0408_S5.cdb'
+    dicom_dir = folder / '0408_s5'
+    params_yaml_file = Path('params.yaml')
+    output_tetmesh = folder / (tetmesh_cdb_file.stem + '_MM.inp')
+    with open(params_yaml_file) as f:
+        parameters = yaml.safe_load(f)
 
-    dicom_data = load_dicom_file(dicom_dir)
-    tetmesh = load_cdb_archive(filename)
-    mesh = FeaMesh(tetmesh.grid, dicom_data)
+    # dicom_data = load_dicom_file(dicom_dir)
+    dicom_data = DicomScan(dicom_dir)  # no SliceLocation param in any
 
-
+    tetmesh = load_cdb_archive(str(tetmesh_cdb_file))
+    mesh = FeaMesh(tetmesh.grid, dicom_data, parameters)
+    write_ansys_inp_file(mesh, output_tetmesh)
+    print(f'Finished in : {perf_counter() - start} seconds')
