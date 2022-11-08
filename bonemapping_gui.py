@@ -98,7 +98,7 @@ class MyMainWindow(MainWindow):
         folder = load_dialog.getExistingDirectory()
         if folder:
             self.dicom_directory_label.setText(Path(folder).stem)
-            self.dicom_data = fx.load_dicom_file(str(folder))
+            self.dicom_data = fx.DicomScan(Path(folder))
 
     def visualize_meshes(self):
         self.plotter.clear()
@@ -106,7 +106,8 @@ class MyMainWindow(MainWindow):
             self.plotter.add_mesh(self.cdb_archive.grid, color='white', label='Tet Mesh')
         if self.dicom_data:
             self.plotter.add_volume(fx.downsample_dicom_volume(self.dicom_data, threshold_value=1000),
-                                    scalars='DICOMImage', name='Downsampled DICOM')
+                                    scalars='HU', name='Downsampled DICOM')
+            # self.plotter.add_volume(self.dicom_data, scalars='HU', name='DICOM', cmap='bone')
         self.plotter.reset_camera()
 
     def rotate_dicom(self):
