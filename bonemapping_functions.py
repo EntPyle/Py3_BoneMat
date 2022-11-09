@@ -109,6 +109,7 @@ class DicomScan(pv.UniformGrid):
         self.hu_data = np.zeros((reduce(operator.mul, img_shape), 4))
 
         # fill 2D array with the image data from the files
+        # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
         self.pixel_spacing = np.array(slices[0].PixelSpacing, dtype=float)  # center-center distance of pixels
         slice_increment_set = {slices[i + 1].ImagePositionPatient[2] - s.ImagePositionPatient[2] for i, s in
                                enumerate(slices[:-1])}
@@ -124,10 +125,10 @@ class DicomScan(pv.UniformGrid):
         grid_to_xyz[-1, -1] = 1
         grid_to_xyz[:-1, 0] = self.row_cosine * self.pixel_spacing[0]
         grid_to_xyz[:-1, 1] = self.col_cosine * self.pixel_spacing[1]
-
+        self.voxel_size = np.array([*self.pixel_spacing, self.slice_increment])
         idx_vector = np.array([0, 0, 0, 1]).reshape(-1, 1)
-        zero_row = np.r_[[0] * img_shape[0] ** 2]
-        one_row = np.r_[[1] * img_shape[0] ** 2]
+        zero_col = np.c_[[0] * img_shape[0] ** 2]
+        one_col = np.c_[[1] * img_shape[0] ** 2]
 
         for i, s in tqdm(enumerate(slices), desc='Pulling xyz and HU data', total=len(slices)):
             img2d = s.pixel_array
@@ -138,10 +139,10 @@ class DicomScan(pv.UniformGrid):
             slice_hu_data = indices_merged_arr(ne.evaluate("img * slope + intercept",
                                                            local_dict={'img': img2d, 'slope': self.rescale_slope,
                                                                        'intercept': self.rescale_int}))  # x_idx, y_idx, HU
-            xyz_one = grid_to_xyz @ np.vstack((slice_hu_data[:, :-1].T, zero_row, one_row))
-            xyz_one[-1, :] = slice_hu_data[:, -1]
+            xyz_one = np.concatenate([slice_hu_data[:, :-1], zero_col, one_col], axis=1) @ grid_to_xyz.T
+            xyz_one[:, -1] = slice_hu_data[:, -1]
             # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + slice_origin[:-1]
-            self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one.T
+            self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one
 
         # hu_df = vaex.from_arrays(x=hu_data[:, 0], y=hu_data[:, 1], z=hu_data[:, 2], HU=hu_data[:, 3])
         # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
