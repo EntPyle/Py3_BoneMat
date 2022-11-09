@@ -56,8 +56,10 @@ def indices_merged_arr(arr):
 
 
 class DicomScan(pv.UniformGrid):
+    """Container using pydicom to load and create a pyvista grid"""
 
     def __init__(self, directory):
+        self.dicom_dir: Path = None
         self.voxel_size = None
         self.rescale_int = None
         self.rescale_slope = None
@@ -73,20 +75,15 @@ class DicomScan(pv.UniformGrid):
         grid.point_data['HU'] = self.hu_data[:, -1]
         super(DicomScan, self).__init__(grid)
 
-    def _sorted_dicom_files(self, dicom_dir):
+    def _sorted_dicom_files(self):
         '''Iterates through dicom files in directory and returns a sorted tuple of file paths by Z'''
-        # from time import perf_counter
-        # start = perf_counter()
-        files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient']) for fname in dicom_dir.iterdir())
-        # load_end = perf_counter() - start
-        # sort_start = perf_counter()
-        sorted_files = (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
-        # sort_end = perf_counter() - sort_start
-        return sorted_files
+        files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient'], stop_before_pixels=True) for fname in self.dicom_dir.iterdir())
+        return (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
 
     def read_xyzhu_from_dcm(self, dicom_dir, skip_scouts=False):
         '''Reads dicom xyz, HU, and other parameters into class. Origin'''
-        files = (pydicom.dcmread(file) for file in self._sorted_dicom_files(dicom_dir))
+        self.dicom_dir = Path(dicom_dir)
+        files = (pydicom.dcmread(file) for file in self._sorted_dicom_files())
 
         if skip_scouts:
             # skip files with no SliceLocation (eg scout views)
