@@ -206,7 +206,7 @@ class FeaMesh(pv.UnstructuredGrid):
         # calculate modulus from hu
         rho_qct_fx_HU_str = ' + '.join(
             [f'{coef}*(HU**{idx})' for idx, coef in enumerate(self.params['CT_Calibration']['ct_coefs'])])
-        rho = ne.evaluate(rho_qct_fx_HU_str, local_dict={'HU':interpolated_hu})
+        rho = ne.evaluate(rho_qct_fx_HU_str, local_dict={'HU': interpolated_hu})
         if self.params['CT_Calibration']['apply_ash_correction']:
             rho_ash_fx_RQCT_str = ' + '.join([f'{coef}*(rho**{idx})' for idx, coef in
                                               enumerate(self.params['CT_Calibration']['ash_correction_coefs'])])
@@ -219,7 +219,7 @@ class FeaMesh(pv.UnstructuredGrid):
         calculated_modulus = ne.evaluate(modulus_fx_RHO_str)
         if self.params['integration']['apply_elasticity_bounds']:
             calculated_modulus = np.clip(calculated_modulus, float(self.params['CT_Calibration']['min_modulus_value']),
-                              float(self.params['CT_Calibration']['max_modulus_value']))
+                                         float(self.params['CT_Calibration']['max_modulus_value']))
         self.interpolated_moduli = calculated_modulus
 
     def _interpolate_modulus(self):
@@ -304,10 +304,10 @@ class FeaMesh(pv.UnstructuredGrid):
         between modulus and density '''
         modulus_coefs = self.params['CT_Calibration']['modulus_coefs']
         rho_ash = ne.evaluate('((mod-coef0)/coef1)**(1/mod_exp)',
-                                          local_dict={'mod':self.binned_moduli,
-                                                      'coef0':modulus_coefs[0],
-                                                      'coef1':modulus_coefs[1],
-                                                      'mod_exp':self.params['CT_Calibration']['modulus_exponent']})
+                              local_dict={'mod': self.binned_moduli,
+                                          'coef0': modulus_coefs[0],
+                                          'coef1': modulus_coefs[1],
+                                          'mod_exp': self.params['CT_Calibration']['modulus_exponent']})
         if self.params['CT_Calibration']['output_rho_qct']:
             # reverse rho_ash_correction
             ash_coefs = self.params['CT_Calibration']['ash_correction_coefs']
@@ -315,9 +315,8 @@ class FeaMesh(pv.UnstructuredGrid):
             self.binned_density = ne.evaluate(rho_qct_fx_RASH_str)
         else:
             self.binned_density = rho_ash
-        self.binned_density = np.clip(self.binned_density, self.params['CT_Calibration']['min_rho'], self.binned_density.max())
-
-
+        self.binned_density = np.clip(self.binned_density, self.params['CT_Calibration']['min_rho'],
+                                      self.binned_density.max())
 
     def _refine_materials(self):
         """This function uses preset parameters to group materials in bins, based on modulus gap value. Without this
@@ -353,6 +352,13 @@ class FeaMesh(pv.UnstructuredGrid):
         return natural_coords, shape_values
 
         # l, r, s, t, w could all be calculated once ahead of time.
+
+    def frequency_table(self):
+        table = np.zeros((self.binned_density.size, 3))
+        table[:, 0] = self.binned_density
+        table[:, 1] = self.binned_moduli
+        table[:, 2] = [elem_map.size for elem_map in self.material_mapping]
+        return table
 
 
 def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
@@ -417,7 +423,6 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
 
 
 if __name__ == '__main__':
-
     # load data and parameters in
     tetmesh_cdb_file = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
     dicom_dir = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'

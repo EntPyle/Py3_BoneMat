@@ -15,7 +15,7 @@ CT_Calibration:
   min_modulus_value: 1e-6
   max_modulus_value: 1E6
   modulus_bin_grouping_method: max  # assign the mean or max modulus in bin to all elements in modulus bin
-  modulus_bin_size: 1  # Material step size definition
+  modulus_bin_size: 50  # Material step size definition
   modulus_coefs: # (a, b, c in E = a + b*rho^i2)
   - 0  # a
   - 14664 # b
