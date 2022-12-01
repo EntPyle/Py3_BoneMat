@@ -77,7 +77,8 @@ class DicomScan(pv.UniformGrid):
 
     def _sorted_dicom_files(self):
         '''Iterates through dicom files in directory and returns a sorted tuple of file paths by Z'''
-        files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient'], stop_before_pixels=True) for fname in self.dicom_dir.iterdir())
+        files = (pydicom.dcmread(fname, specific_tags=['ImagePositionPatient'], stop_before_pixels=True) for fname in
+                 self.dicom_dir.iterdir())
         return (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
 
     def read_xyzhu_from_dcm(self, dicom_dir, skip_scouts=False):
@@ -275,7 +276,11 @@ class FeaMesh(pv.UnstructuredGrid):
         # for each co-ordinate, interpolate moduli
         interp_result = ct_interp(interpolation_coordinates_arr)
         n_naturals = perfect_natural_coord.shape[0]
-        self.interpolated_moduli = ne.evaluate("sum(interp_result/ n_naturals, axis=1)")
+        calculated_modulus = ne.evaluate("sum(interp_result/ n_naturals, axis=1)")
+        if self.params['integration']['apply_elasticity_bounds']:
+            calculated_modulus = np.clip(calculated_modulus, float(self.params['CT_Calibration']['min_modulus_value']),
+                                         float(self.params['CT_Calibration']['max_modulus_value']))
+        self.interpolated_moduli = calculated_modulus
 
     def _bin_modulus(self):
         '''This functions creates and bins material properties based on passed parameters to reduce the number of
@@ -315,7 +320,8 @@ class FeaMesh(pv.UnstructuredGrid):
             self.binned_density = ne.evaluate(rho_qct_fx_RASH_str)
         else:
             self.binned_density = rho_ash
-        self.binned_density = np.clip(self.binned_density, self.params['CT_Calibration']['min_rho'],
+        self.binned_density = np.clip(self.binned_density,
+                                      self.params['CT_Calibration']['min_rho'],
                                       self.binned_density.max())
 
     def _refine_materials(self):
@@ -323,6 +329,22 @@ class FeaMesh(pv.UnstructuredGrid):
         all elements would have independent material properties """
         self._bin_modulus()
         self._backcalculate_density()
+        self._check_for_merged_materials()
+
+    def _check_for_merged_materials(self):
+        # check min density merge
+        min_density_merged_mask = self.binned_density == self.params['CT_Calibration']['min_rho']
+        min_density_merged_indices = np.argwhere(min_density_merged_mask).ravel()
+        if min_density_merged_indices.size > 1:
+            # get merged element index array
+            merged_element_indices = np.array(list(chain.from_iterable([self.material_mapping[idx] for idx in min_density_merged_indices])))
+            # get rid of material rows that were merged into one
+            cutoff_idx = min_density_merged_indices[0] + 1
+            self.binned_moduli = self.binned_moduli[:cutoff_idx]
+            self.binned_density = self.binned_density[:cutoff_idx]
+            self.material_mapping = self.material_mapping[:cutoff_idx]
+            self.material_mapping[-1] = merged_element_indices
+
 
     @staticmethod
     def _get_natural_coordinates(step):

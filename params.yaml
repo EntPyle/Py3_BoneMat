@@ -12,10 +12,10 @@ CT_Calibration:
     - 0.0789
     - 0.877
   min_rho: 1.0e-06 # densities below this are assumed to be equal to minVal
-  min_modulus_value: 1e-6
+  min_modulus_value: 2.75e-4
   max_modulus_value: 1E6
   modulus_bin_grouping_method: max  # assign the mean or max modulus in bin to all elements in modulus bin
-  modulus_bin_size: 1  # Material step size definition
+  modulus_bin_size: 50  # Material step size definition
   modulus_coefs: # (a, b, c in E = a + b*rho^i2)
   - 0  # a
   - 6.95 # b

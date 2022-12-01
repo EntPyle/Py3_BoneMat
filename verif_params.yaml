@@ -1,7 +1,7 @@
 integration:
   method: HU # equivalent to BoneMat V3. Only implementation currently
   steps: 4
-  apply_elasticity_bounds: false
+  apply_elasticity_bounds: true
 CT_Calibration:
   ct_coefs: # (a, b, c, ... n in rho_QCT = a + b*HU + c*HU^2...) where x is HU.
   - -0.02066 # a
@@ -11,10 +11,10 @@ CT_Calibration:
   ash_correction_coefs: # (a, b, c, ... n in y = a + bx + cx2..) where x is rho_QCT
     - 0.07895
     - 0.8772
-  min_rho: 1.0e-06 # densities below this are assumed to be equal to minVal
+  min_rho: 2.75e-4 # densities below this are assumed to be equal to minVal
   min_modulus_value: 1e-6
   max_modulus_value: 1E6
-  modulus_bin_grouping_method: max  # assign the mean or max modulus in bin to all elements in modulus bin
+  modulus_bin_grouping_method: mean  # assign the mean or max modulus in bin to all elements in modulus bin
   modulus_bin_size: 50  # Material step size definition
   modulus_coefs: # (a, b, c in E = a + b*rho^i2)
   - 0  # a
