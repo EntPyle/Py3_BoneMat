@@ -8,7 +8,6 @@ channels:
   - plotly
   - numba
 dependencies:
-  - ansys-mapdl-reader
   - cython
   - dataclasses
   - h5py
