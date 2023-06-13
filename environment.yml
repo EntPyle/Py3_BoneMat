@@ -1,0 +1,39 @@
+name: bonemapping
+channels:
+  - nvidia
+  - conda-forge
+  - anaconda
+  - intel
+  - defaults
+  - plotly
+  - numba
+dependencies:
+  - ansys-mapdl-reader
+  - cython
+  - dataclasses
+  - h5py
+  - intel-openmp
+  - intelpython
+  - loguru
+  - matplotlib-base
+  - meshio
+  - nsight-compute
+  - numba
+  - numexpr
+  - numpy
+  - pandas
+  - pip
+  - plotly
+  - plotly_express
+  - pydicom
+  - pyntcloud
+  - pyqt
+  - pyqtchart
+  - pyside2
+  - python=3.10.6
+  - pyvista
+  - pyvistaqt
+  - scipy
+  - snakeviz
+  - tqdm
+  - trimesh
