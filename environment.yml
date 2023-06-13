@@ -37,4 +37,4 @@ dependencies:
   - tqdm
   - trimesh
   - pip:
-      ansys-mapdl-reader
+      - ansys-mapdl-reader
