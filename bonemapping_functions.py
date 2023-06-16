@@ -12,7 +12,7 @@ from scipy.interpolate import RegularGridInterpolator
 from tqdm import tqdm
 import pydicom
 import operator
-from functools import reduce
+from functools import reduce, partial
 import yaml
 from datetime import datetime
 from itertools import chain, repeat
@@ -96,53 +96,56 @@ class DicomScan(pv.UniformGrid):
                 else:
                     skipcount += 1
 
-            print("skipped, no SliceLocation: {}".format(skipcount))
+            logger.debug("skipped, no SliceLocation: {}".format(skipcount))
 
             # ensure remaining are in the correct order
             slices = sorted(slices, key=lambda s: s.SliceLocation)
         else:
             slices = tuple(files)
 
+        slice0 = slices[0]
         # create 3D array
-        img_shape = list(slices[0].pixel_array.shape)
-        img_shape.append(len(slices))
+        img_shape = [*(slice0.pixel_array.shape), len(slices)]
         self.grid_shape = img_shape
         self.hu_data = np.zeros((reduce(operator.mul, img_shape), 4))
 
         # fill 2D array with the image data from the files
         # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
-        self.pixel_spacing = np.array(slices[0].PixelSpacing, dtype=float)  # center-center distance of pixels
+        self.pixel_spacing = np.array(slice0.PixelSpacing, dtype=float)  # center-center distance of pixels
         slice_increment_set = {slices[i + 1].ImagePositionPatient[2] - s.ImagePositionPatient[2] for i, s in
                                enumerate(slices[:-1])}
-        # todo consider raising a warning unequally spaced data
+        if len(slice_increment_set) > 1: logger.warning(
+            f'There are {len(slice_increment_set)} different spacings between slices.')
         self.slice_increment = tuple(slice_increment_set)[0] if len(slice_increment_set) == 1 else \
-            slices[1].ImagePositionPatient[2] - slices[0].ImagePositionPatient[2]
-        self.slice_thickness = np.array(slices[0].SliceThickness, dtype=float)  # center-center distance of pixels
-        self.row_cosine = np.array(slices[0].ImageOrientationPatient[:3], dtype=float)
-        self.col_cosine = np.array(slices[0].ImageOrientationPatient[-3:], dtype=float)
-        self.rescale_slope = float(slices[0].RescaleSlope)
-        self.rescale_int = float(slices[0].RescaleIntercept)
+            slices[1].ImagePositionPatient[2] - slice0.ImagePositionPatient[2]
+        self.slice_thickness = float(slice0.SliceThickness)  # center-center distance of pixels
+        self.row_cosine = np.array(slice0.ImageOrientationPatient[:3], dtype=float)
+        self.col_cosine = np.array(slice0.ImageOrientationPatient[-3:], dtype=float)
+        self.rescale_slope = float(slice0.RescaleSlope)
+        self.rescale_int = float(slice0.RescaleIntercept)
         grid_to_xyz = np.zeros((4, 4))
         grid_to_xyz[-1, -1] = 1
         grid_to_xyz[:-1, 0] = self.row_cosine * self.pixel_spacing[0]
         grid_to_xyz[:-1, 1] = self.col_cosine * self.pixel_spacing[1]
         self.voxel_size = np.array([*self.pixel_spacing, self.slice_increment])
         idx_vector = np.array([0, 0, 0, 1]).reshape(-1, 1)
-        zero_col = np.c_[[0] * img_shape[0] ** 2]
-        one_col = np.c_[[1] * img_shape[0] ** 2]
-
+        # zero_col = np.c_[[0] * img_shape[0] ** 2]
+        # one_col = np.c_[[1] * img_shape[0] ** 2]
+        zero_col = np.zeros((img_shape[0] ** 2, 1))
+        one_col = np.ones((img_shape[0] ** 2, 1))
+        self.origin = slice0.ImagePositionPatient
         for i, s in tqdm(enumerate(slices), desc='Pulling xyz and HU data', total=len(slices)):
             img2d = s.pixel_array
-            slice_origin = np.array(s.ImagePositionPatient, dtype=float)  # Top left corner
-            grid_to_xyz[:-1, -1] = slice_origin
-            if i == 0:
-                self.origin = slice_origin
+            # slice_origin = np.array(s.ImagePositionPatient, dtype=float)  # Top left corner
+            grid_to_xyz[:-1, -1] = s.ImagePositionPatient
+            # if i == 0:
+            #     self.origin = grid_to_xyz[:-1, -1]
             slice_hu_data = indices_merged_arr(ne.evaluate("img * slope + intercept",
                                                            local_dict={'img': img2d, 'slope': self.rescale_slope,
                                                                        'intercept': self.rescale_int}))  # x_idx, y_idx, HU
             xyz_one = np.concatenate([slice_hu_data[:, :-1], zero_col, one_col], axis=1) @ grid_to_xyz.T
             xyz_one[:, -1] = slice_hu_data[:, -1]
-            # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + slice_origin[:-1]
+            # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + grid_to_xyz[:-1, -1][:-1]
             self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one
 
         # hu_df = vaex.from_arrays(x=hu_data[:, 0], y=hu_data[:, 1], z=hu_data[:, 2], HU=hu_data[:, 3])
@@ -263,7 +266,6 @@ class FeaMesh(pv.UnstructuredGrid):
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
         ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus)
 
-        # todo I think I can get rid of this for loop
         elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:][:, np.newaxis, ...]
         # find co-ordinate for each iteration using shape functions
         # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
@@ -337,14 +339,14 @@ class FeaMesh(pv.UnstructuredGrid):
         min_density_merged_indices = np.argwhere(min_density_merged_mask).ravel()
         if min_density_merged_indices.size > 1:
             # get merged element index array
-            merged_element_indices = np.array(list(chain.from_iterable([self.material_mapping[idx] for idx in min_density_merged_indices])))
+            merged_element_indices = np.array(
+                list(chain.from_iterable([self.material_mapping[idx] for idx in min_density_merged_indices])))
             # get rid of material rows that were merged into one
             cutoff_idx = min_density_merged_indices[0] + 1
             self.binned_moduli = self.binned_moduli[:cutoff_idx]
             self.binned_density = self.binned_density[:cutoff_idx]
             self.material_mapping = self.material_mapping[:cutoff_idx]
             self.material_mapping[-1] = merged_element_indices
-
 
     @staticmethod
     def _get_natural_coordinates(step):
@@ -446,11 +448,14 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
 
 if __name__ == '__main__':
     # load data and parameters in
-    tetmesh_cdb_file = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
-    dicom_dir = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'
-    # params_yaml_file = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / 'params.yaml'
-    params_yaml_file = Path('params.yaml')
-    output_tetmesh = Path(r'C:\Users\Npyle1\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (tetmesh_cdb_file.stem + '_MM.inp')
+    tetmesh_cdb_file = Path(
+        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
+    dicom_dir = Path(
+        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'
+    params_yaml_file = Path('verif_params.yaml')
+    output_tetmesh = Path(
+        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (
+                             tetmesh_cdb_file.stem + '_MM.inp')
     with open(params_yaml_file) as f:
         parameters = yaml.safe_load(f)
 
