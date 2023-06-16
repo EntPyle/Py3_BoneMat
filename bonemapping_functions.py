@@ -52,7 +52,7 @@ def indices_merged_arr(arr):
     out[..., -1] = arr
     out.shape = (-1, n + 1)
     # out[:, :2] = out[:, (1, 0)]
-    return out
+    return out[:, :-1], out[:, -1]
 
 
 class DicomScan(pv.UniformGrid):
@@ -107,7 +107,7 @@ class DicomScan(pv.UniformGrid):
         # create 3D array
         img_shape = [*(slice0.pixel_array.shape), len(slices)]
         self.grid_shape = img_shape
-        self.hu_data = np.zeros((reduce(operator.mul, img_shape), 4))
+        self.hu_data = np.multiply(np.ones((reduce(operator.mul, img_shape), 4)), [0, 0, 0, 1])
 
         # fill 2D array with the image data from the files
         # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
@@ -129,23 +129,18 @@ class DicomScan(pv.UniformGrid):
         grid_to_xyz[:-1, 1] = self.col_cosine * self.pixel_spacing[1]
         self.voxel_size = np.array([*self.pixel_spacing, self.slice_increment])
         idx_vector = np.array([0, 0, 0, 1]).reshape(-1, 1)
-        # zero_col = np.c_[[0] * img_shape[0] ** 2]
-        # one_col = np.c_[[1] * img_shape[0] ** 2]
-        zero_col = np.zeros((img_shape[0] ** 2, 1))
-        one_col = np.ones((img_shape[0] ** 2, 1))
-        self.origin = slice0.ImagePositionPatient
+
         for i, s in tqdm(enumerate(slices), desc='Pulling xyz and HU data', total=len(slices)):
             img2d = s.pixel_array
-            # slice_origin = np.array(s.ImagePositionPatient, dtype=float)  # Top left corner
             grid_to_xyz[:-1, -1] = s.ImagePositionPatient
-            # if i == 0:
-            #     self.origin = grid_to_xyz[:-1, -1]
-            slice_hu_data = indices_merged_arr(ne.evaluate("img * slope + intercept",
+            if i == 0:
+                self.origin = grid_to_xyz[:-1, -1]
+            df = self.hu_data[i * img2d.size:(i + 1) * img2d.size]
+            df[:, :2], slice_hu_arr = indices_merged_arr(ne.evaluate("img * slope + intercept",
                                                            local_dict={'img': img2d, 'slope': self.rescale_slope,
-                                                                       'intercept': self.rescale_int}))  # x_idx, y_idx, HU
-            xyz_one = np.concatenate([slice_hu_data[:, :-1], zero_col, one_col], axis=1) @ grid_to_xyz.T
-            xyz_one[:, -1] = slice_hu_data[:, -1]
-            # slice_hu_data[:, :2] = slice_hu_data[:, :2] * pixel_spacing + grid_to_xyz[:-1, -1][:-1]
+                                                                       'intercept': self.rescale_int}))  # (x_idx, y_idx), HU
+            xyz_one = df @ grid_to_xyz.T
+            xyz_one[:, -1] = slice_hu_arr
             self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one
 
         # hu_df = vaex.from_arrays(x=hu_data[:, 0], y=hu_data[:, 1], z=hu_data[:, 2], HU=hu_data[:, 3])
