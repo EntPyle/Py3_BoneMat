@@ -7,7 +7,7 @@ from loguru import logger
 import numexpr as ne
 
 ne.set_num_threads(8)
-ne.use_vml = True
+ne.use_vml = False
 from scipy.interpolate import RegularGridInterpolator
 from tqdm import tqdm
 import pydicom
@@ -16,6 +16,8 @@ from functools import reduce, partial
 import yaml
 from datetime import datetime
 from itertools import chain, repeat
+import SimpleITK as sitk
+import trio
 
 
 def load_cdb_archive(cdb_filepath):
@@ -43,6 +45,7 @@ def rotate_pyvista_grid(grid, angle=180, rotation_axis=(0, 0, 1)):
     return grid.transform(rot_matrix, inplace=False)
 
 
+# def indices_merged_arr(arr):
 def indices_merged_arr(arr):
     n = arr.ndim
     grid = np.ogrid[tuple(map(slice, arr.shape))]
@@ -52,6 +55,7 @@ def indices_merged_arr(arr):
     out[..., -1] = arr
     out.shape = (-1, n + 1)
     # out[:, :2] = out[:, (1, 0)]
+    # return out[:, :-1], out[:, -1]
     return out[:, :-1], out[:, -1]
 
 
@@ -70,7 +74,7 @@ class DicomScan(pv.UniformGrid):
         self.hu_data = None
         self.grid_shape = None
         self.col_cosine = None
-        self.read_xyzhu_from_dcm(directory, False)
+        self.read_xyzhu_from_dcm_sitk(directory, False)
         grid = pv.UniformGrid(dims=self.grid_shape, origin=self.origin, spacing=self.voxel_size)
         grid.point_data['HU'] = self.hu_data[:, -1]
         super(DicomScan, self).__init__(grid)
@@ -81,7 +85,32 @@ class DicomScan(pv.UniformGrid):
                  self.dicom_dir.iterdir())
         return (Path(file.filename) for file in sorted(files, key=lambda s: s.ImagePositionPatient[2]))
 
-    def read_xyzhu_from_dcm(self, dicom_dir, skip_scouts=False):
+    def read_xyzhu_from_dcm_sitk(self, dicom_dir, skip_scouts=False):
+        self.dicom_dir = Path(dicom_dir)
+
+        reader = sitk.ImageSeriesReader()
+
+        dicom_names = reader.GetGDCMSeriesFileNames(str(self.dicom_dir))
+        reader.SetFileNames(dicom_names)
+
+        image = reader.Execute()
+        arr = sitk.GetArrayFromImage(image)
+        self.voxel_size = image.GetSpacing()
+        self.grid_shape = image.GetSize()
+        self.origin = image.GetOrigin()
+        grid_to_xyz = np.zeros((4, 4))
+        grid_to_xyz[:-1, :-1] = np.reshape(image.GetDirection(), (3, -1)) * np.transpose(image.GetSpacing())
+        grid_to_xyz[-1, :-1] = self.origin
+
+        kij, hu = indices_merged_arr(arr)
+        ijk1 = np.ones((kij.shape[0], 4))
+        ijk1[:, :-1] = kij[:, [1, 2, 0]]
+
+        xyz1 = ijk1 @ grid_to_xyz
+        xyz1[:, -1] = hu
+        self.hu_data = xyz1
+
+    def read_xyzhu_from_dcm_original(self, dicom_dir, skip_scouts=False):
         '''Reads dicom xyz, HU, and other parameters into class. Origin'''
         self.dicom_dir = Path(dicom_dir)
         files = (pydicom.dcmread(file) for file in self._sorted_dicom_files())
@@ -137,15 +166,78 @@ class DicomScan(pv.UniformGrid):
                 self.origin = grid_to_xyz[:-1, -1]
             df = self.hu_data[i * img2d.size:(i + 1) * img2d.size]
             df[:, :2], slice_hu_arr = indices_merged_arr(ne.evaluate("img * slope + intercept",
-                                                           local_dict={'img': img2d, 'slope': self.rescale_slope,
-                                                                       'intercept': self.rescale_int}))  # (x_idx, y_idx), HU
+                                                                     local_dict={'img': img2d,
+                                                                                 'slope': self.rescale_slope,
+                                                                                 'intercept': self.rescale_int}))  # (x_idx, y_idx), HU
             xyz_one = df @ grid_to_xyz.T
             xyz_one[:, -1] = slice_hu_arr
             self.hu_data[i * img2d.size:(i + 1) * img2d.size] = xyz_one
 
         # hu_df = vaex.from_arrays(x=hu_data[:, 0], y=hu_data[:, 1], z=hu_data[:, 2], HU=hu_data[:, 3])
         # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
+
+    def read_xyzhu_from_dcm_hybrid(self, dicom_dir, skip_scouts=False):  # slower than original
+        '''Reads dicom xyz, HU, and other parameters into class. Origin'''
+        self.dicom_dir = Path(dicom_dir)
+        files = (pydicom.dcmread(file) for file in self._sorted_dicom_files())
+
+        if skip_scouts:
+            # skip files with no SliceLocation (eg scout views)
+            slices = []
+            skipcount = 0
+            for f in files:
+                if hasattr(f, 'SliceLocation'):
+                    slices.append(f)
+                else:
+                    skipcount += 1
+
+            logger.debug("skipped, no SliceLocation: {}".format(skipcount))
+
+            # ensure remaining are in the correct order
+            slices = sorted(slices, key=lambda s: s.SliceLocation)
+        else:
+            slices = tuple(files)
+
+        slice0 = slices[0]
+        # create 3D array
+        img_shape = [*(slice0.pixel_array.shape), len(slices)]
+        self.grid_shape = img_shape
+
+        # fill 2D array with the image data from the files
+        # https://dicom.innolitics.com/ciods/ct-image/image-plane/00200032
+        self.pixel_spacing = np.array(slice0.PixelSpacing, dtype=float)  # center-center distance of pixels
+        slice_increment_set = {slices[i + 1].ImagePositionPatient[2] - s.ImagePositionPatient[2] for i, s in
+                               enumerate(slices[:-1])}
+        if len(slice_increment_set) > 1: logger.warning(
+            f'There are {len(slice_increment_set)} different spacings between slices.')
+        self.slice_increment = tuple(slice_increment_set)[0] if len(slice_increment_set) == 1 else \
+            slices[1].ImagePositionPatient[2] - slice0.ImagePositionPatient[2]
+        self.slice_thickness = float(slice0.SliceThickness)  # center-center distance of pixels
+        self.row_cosine = np.array(slice0.ImageOrientationPatient[:3], dtype=float)
+        self.col_cosine = np.array(slice0.ImageOrientationPatient[-3:], dtype=float)
+        self.rescale_slope = float(slice0.RescaleSlope)
+        self.rescale_int = float(slice0.RescaleIntercept)
+        self.origin = slice0.ImagePositionPatient
+
+        grid_to_xyz = np.zeros((4, 4))
+        grid_to_xyz[-1, -1] = 1
+        grid_to_xyz[:-1, 0] = self.row_cosine * self.pixel_spacing[0]
+        grid_to_xyz[:-1, 1] = self.col_cosine * self.pixel_spacing[1]
+        grid_to_xyz[:-1, 2] = np.cross(self.row_cosine, self.col_cosine) * self.slice_increment
+        grid_to_xyz[-1, :-1] = self.origin
+
         self.voxel_size = np.array([*self.pixel_spacing, self.slice_increment])
+
+        all_arr = np.concatenate([s.pixel_array[np.newaxis, ...] for s in slices])
+        kij, hu = indices_merged_arr(ne.evaluate("img * slope + intercept",
+                                                 local_dict={'img': all_arr, 'slope': self.rescale_slope,
+                                                             'intercept': self.rescale_int}))
+        ijk1 = np.ones((kij.shape[0], 4))
+        ijk1[:, :-1] = kij[:, [1, 2, 0]]
+
+        xyz1 = ijk1 @ grid_to_xyz
+        xyz1[:, -1] = hu
+        self.hu_data = xyz1
 
 
 class FeaMesh(pv.UnstructuredGrid):
