@@ -28,12 +28,13 @@ dependencies:
   - pyqt
   - pyqtchart
   - pyside2
-  - python=3.10.6
-  - pyvista
+  - python=3
+  - pyvista>=0.43
   - pyvistaqt
   - scipy
   - snakeviz
   - tqdm
   - trimesh
+  - yaml
   - pip:
       - ansys-mapdl-reader

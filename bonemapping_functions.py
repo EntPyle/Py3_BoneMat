@@ -59,7 +59,7 @@ def indices_merged_arr(arr):
     return out[:, :-1], out[:, -1]
 
 
-class DicomScan(pv.UniformGrid):
+class DicomScan(pv.ImageData):
     """Container using pydicom to load and create a pyvista grid"""
 
     def __init__(self, directory):
@@ -75,7 +75,7 @@ class DicomScan(pv.UniformGrid):
         self.grid_shape = None
         self.col_cosine = None
         self.read_xyzhu_from_dcm_sitk(directory, False)
-        grid = pv.UniformGrid(dims=self.grid_shape, origin=self.origin, spacing=self.voxel_size)
+        grid = pv.ImageData(dims=self.grid_shape, origin=self.origin, spacing=self.voxel_size)
         grid.point_data['HU'] = self.hu_data[:, -1]
         super(DicomScan, self).__init__(grid)
 
@@ -242,7 +242,7 @@ class DicomScan(pv.UniformGrid):
 
 class FeaMesh(pv.UnstructuredGrid):
 
-    def __init__(self, grid: pv.UnstructuredGrid, dicom_data: pv.UniformGrid, params: dict):
+    def __init__(self, grid: pv.UnstructuredGrid, dicom_data: pv.ImageData, params: dict):
         super(FeaMesh, self).__init__(grid)
         self.ct_data = dicom_data
         self.hu = dicom_data.get_array('HU')
@@ -508,10 +508,15 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
         element_nodes_data.append(f'TYPE, 2 $ MAT, {mat_idx + 1} $ REAL, 0')
         for elem_idx in element_set:
             el_id = elem_ids[elem_idx]
+            cell = mesh.get_cell(el_id)
             element_nodes_data.append(
-                f'EN,{sep}{el_id},{sep}{("," + sep).join(map(str, nd_ids[mesh.cell_point_ids(el_id)[:-2]]))}')
-            element_nodes_data.append(
-                f'EMORE,{sep}{("," + sep).join(map(str, nd_ids[mesh.cell_point_ids(el_id)[-2:]]))}')
+                f'EN,{sep}{el_id},{sep}{("," + sep).join(map(str, nd_ids[cell.point_ids[:8]]))}')
+            if cell.n_points > 8:
+                element_nodes_data.append(
+                    f'EMORE,{sep}{("," + sep).join(map(str, nd_ids[cell.point_ids[8:16]]))}')
+            if cell.n_points > 16:
+                element_nodes_data.append(
+                    f'EMORE,{sep}{("," + sep).join(map(str, nd_ids[cell.point_ids[16:]]))}')
         element_nodes_data.append(f'CM, TYPE2-REAL0-MAT{mat_idx + 1}, ELEM')
 
     # TYPE, 2 $ MAT, mat_id $ REAL, 0  # element type ptr? material id.
