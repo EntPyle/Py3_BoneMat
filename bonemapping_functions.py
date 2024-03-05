@@ -265,11 +265,6 @@ class FeaMesh(pv.UnstructuredGrid):
         :return:
         """
         step = 1.0 / self.params['integration']['steps']
-        # establish natural coordinates
-        perfect_natural_coord, shape_fx_values = self._get_natural_coordinates(step)
-        # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
-        # pv._vtk.VTK_QUADRATIC_TETRA
-        # todo adapt to multiple input element shapes
         # using numexpr to evaluate dynamically built string expressions on arrays.
         HU = self.hu
         # HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
@@ -280,8 +275,17 @@ class FeaMesh(pv.UnstructuredGrid):
         # shaped_modulus = modulus.reshape([3, 3, 3])
         #  test_coords = [-1, 0, 1]
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
-        ct_interp = RegularGridInterpolator((x, y, z), shaped_hu)
-        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:][:, np.newaxis, ...]
+        ct_interp = RegularGridInterpolator((x, y, z), shaped_hu, bounds_error=True)
+        if np.all(self.celltypes == pv.CellType.QUADRATIC_TETRA):
+            pts_per_cell = 10
+        elif np.all(self.celltypes == pv.CellType.TETRA):
+            pts_per_cell = 4
+        # establish natural coordinates
+        perfect_natural_coord, shape_fx_values = self._get_natural_tet_coordinates(step, pts_per_cell)
+        # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
+        # pv._vtk.VTK_QUADRATIC_TETRA
+        # todo adapt to multiple input element shapes
+        elem_pts_arr = self.points[self.cells.reshape(-1, pts_per_cell + 1)][:, 1:][:, np.newaxis, ...]
         # find co-ordinate for each iteration using shape functions
         # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
         #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
@@ -321,7 +325,7 @@ class FeaMesh(pv.UnstructuredGrid):
         """
         step = 1.0 / self.params['integration']['steps']
         # establish natural coordinates
-        perfect_natural_coord, shape_fx_values = self._get_natural_coordinates(step)
+        perfect_natural_coord, shape_fx_values = self._get_natural_tet_coordinates(step)
         # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
         # pv._vtk.VTK_QUADRATIC_TETRA
         # todo adapt to multiple input element shapes
@@ -351,9 +355,17 @@ class FeaMesh(pv.UnstructuredGrid):
         # shaped_modulus = modulus.reshape([3, 3, 3])
         #  test_coords = [-1, 0, 1]
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
-        ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus)
-
-        elem_pts_arr = self.points[self.cells.reshape(-1, 11)][:, 1:][:, np.newaxis, ...]
+        ct_interp = RegularGridInterpolator((x, y, z), shaped_hu, bounds_error=True)
+        if np.all(self.celltypes == pv.CellType.QUADRATIC_TETRA):
+            pts_per_cell = 10
+        elif np.all(self.celltypes == pv.CellType.TETRA):
+            pts_per_cell = 4
+        # establish natural coordinates
+        perfect_natural_coord, shape_fx_values = self._get_natural_tet_coordinates(step, pts_per_cell)
+        # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
+        # pv._vtk.VTK_QUADRATIC_TETRA
+        # todo adapt to multiple input element shapes
+        elem_pts_arr = self.points[self.cells.reshape(-1, pts_per_cell + 1)][:, 1:][:, np.newaxis, ...]
         # find co-ordinate for each iteration using shape functions
         # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
         #                                         25, 10, 15, 20, 15, 20, 25, 20, 25, 30])
@@ -436,30 +448,45 @@ class FeaMesh(pv.UnstructuredGrid):
             self.material_mapping[-1] = merged_element_indices
 
     @staticmethod
-    def _get_natural_coordinates(step):
-        """Method to create natural coordinates for a TET10 element"""
-        natural_coords = np.zeros((10, 4))
-        shape_values = np.zeros((10, 10, 1))
+    def _get_natural_tet_coordinates(step, nodes_per_element=10):
+        """Method to create natural coordinates for an n_noded element"""
+        natural_coord_lists = []
+        # natural_coords = np.zeros((nodes_per_element, 4))
+        shape_value_lists = []
+        # shape_value = np.zeros((nodes_per_element, nodes_per_element, 1))
         count = 0
+        # l, r, s, t are normalized coordinates, (L1, L2, L3, L4 in bme.hu reference)
+        # going from 0.0 at a vertex to 1.0 at the opposite sie or face
         for t in np.arange(step / 2., 1, step):
             for s in np.arange(step / 2., 1 - t, step):
                 for r in np.arange(step / 2., 1 - s - t, step):
                     l = 1 - r - s - t
                     # calculate shape functions
                     # https: // www.sciencedirect.com / topics / engineering / tetrahedron - element
-                    w = np.array([[(2 * l - 1) * l],
-                                  [(2 * r - 1) * r],
-                                  [(2 * s - 1) * s],
-                                  [(2 * t - 1) * t],
-                                  [4 * l * r],
-                                  [4 * r * s],
-                                  [4 * l * s],
-                                  [4 * l * t],
-                                  [4 * r * t],
-                                  [4 * s * t]])
-                    natural_coords[count] = [l, r, s, t]
-                    shape_values[count] = w
+                    # https: // www.mm.bme.hu / ~gyebro / files / ans_help_v182 / ans_thry / thy_shp8.html
+                    if nodes_per_element == 10:
+                        w = np.array([[(2 * l - 1) * l],
+                                      [(2 * r - 1) * r],
+                                      [(2 * s - 1) * s],
+                                      [(2 * t - 1) * t],
+                                      [4 * l * r],
+                                      [4 * r * s],
+                                      [4 * l * s],
+                                      [4 * l * t],
+                                      [4 * r * t],
+                                      [4 * s * t]])
+                    else:
+                        w = np.array([[l],
+                                      [r],
+                                      [s],
+                                      [t]])
+                    # natural_coords[count] = [l, r, s, t]
+                    # shape_values[count] = w
+                    natural_coord_lists.append([l, r, s, t])
+                    shape_value_lists.append(w)
                     count += 1
+        natural_coords = np.array(natural_coord_lists)
+        shape_values = np.array(shape_value_lists)
         return natural_coords, shape_values
 
         # l, r, s, t, w could all be calculated once ahead of time.
@@ -540,19 +567,34 @@ def write_ansys_inp_file(mesh: FeaMesh, file_path: Path):
 
 if __name__ == '__main__':
     # load data and parameters in
-    tetmesh_cdb_file = Path(
-        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
-    dicom_dir = Path(
-        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'
-    params_yaml_file = Path('verif_params.yaml')
-    output_tetmesh = Path(
-        r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (
-                             tetmesh_cdb_file.stem + '_MM.inp')
+    original_data = False
+    if original_data:
+        tetmesh_file = Path(
+            r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_S5.cdb'
+        dicom_dir = Path(
+            r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / '0408_s5'
+        params_yaml_file = Path('verif_params.yaml')
+        output_tetmesh = Path(
+            r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (
+                                 tetmesh_file.stem + '_MM.inp')
+    else:
+        p3_dir = Path(r'D:\OneDrive - DJO LLC\Documents\Matchpoint Drive Data\p3. Segmented CT Scans')
+        tetmesh_file = p3_dir / 'Segmented Scans\DAU14\DAU14-UKU-QUG/uku_quq_vol.vtk'
+        dicom_dir = p3_dir / 'Segmented Scans\DAU14\DAU14-UKU-QUG\ScalarVolume_11'
+        params_yaml_file = p3_dir / 'Segmented Scans\DAU14\DAU14-UKU-QUG/verif_params.yaml'
+        output_tetmesh = Path(
+            r'D:\OneDrive - DJO LLC\active_projects\Bone Density Paper\Bonemat Dev Tests') / (
+                                 tetmesh_file.stem + '_MM.inp')
     with open(params_yaml_file) as f:
         parameters = yaml.safe_load(f)
 
     # dicom_data = load_dicom_file(dicom_dir)
     dicom_data = DicomScan(dicom_dir)
-    tetmesh = load_cdb_archive(str(tetmesh_cdb_file))
-    mesh = FeaMesh(tetmesh.grid, dicom_data, parameters)
+    if tetmesh_file.suffix == '.cdb':
+        tetmesh = load_cdb_archive(str(tetmesh_file)).grid
+    else:
+        tetmesh = pv.read(tetmesh_file)
+        tetmesh = tetmesh.extract_cells_by_type(pv.CellType.TETRA)
+    # todo add the option of loading image from different sources (nrrds, h5, etc)
+    mesh = FeaMesh(tetmesh, dicom_data, parameters)
     write_ansys_inp_file(mesh, output_tetmesh)
