@@ -284,7 +284,6 @@ class FeaMesh(pv.UnstructuredGrid):
         perfect_natural_coord, shape_fx_values = self._get_natural_tet_coordinates(step, pts_per_cell)
         # py_abq_nodes = [0, 1, 2, 3, 01, 12, 20, 04, 31, 32] matches vtk/pyvista
         # pv._vtk.VTK_QUADRATIC_TETRA
-        # todo adapt to multiple input element shapes
         elem_pts_arr = self.points[self.cells.reshape(-1, pts_per_cell + 1)][:, 1:][:, np.newaxis, ...]
         # find co-ordinate for each iteration using shape functions
         # test_HU = np.array([0, 5, 10, 5, 10, 15, 10, 15, 20, 5, 10, 15, 10, 15, 20, 15, 20,
@@ -355,7 +354,7 @@ class FeaMesh(pv.UnstructuredGrid):
         # shaped_modulus = modulus.reshape([3, 3, 3])
         #  test_coords = [-1, 0, 1]
         #  ct_interp = RegularGridInterpolator((test_coords, test_coords, test_coords), shaped_modulus)
-        ct_interp = RegularGridInterpolator((x, y, z), shaped_hu, bounds_error=True)
+        ct_interp = RegularGridInterpolator((x, y, z), shaped_modulus, bounds_error=True)
         if np.all(self.celltypes == pv.CellType.QUADRATIC_TETRA):
             pts_per_cell = 10
         elif np.all(self.celltypes == pv.CellType.TETRA):
