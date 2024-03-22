@@ -62,8 +62,9 @@ def indices_merged_arr(arr):
 class DicomScan(pv.ImageData):
     """Container using pydicom to load and create a pyvista grid"""
 
-    def __init__(self, directory):
+    def __init__(self, directory, data_orientation=None):
         self.dicom_dir: Path = None
+        self.data_patient_orientation = data_orientation
         self.voxel_size = None
         self.rescale_int = None
         self.rescale_slope = None
@@ -92,8 +93,16 @@ class DicomScan(pv.ImageData):
 
         dicom_names = reader.GetGDCMSeriesFileNames(str(self.dicom_dir))
         reader.SetFileNames(dicom_names)
+        reader.MetaDataDictionaryArrayUpdateOn()
+        reader.LoadPrivateTagsOn()
 
         image = reader.Execute()
+        for k in reader.GetMetaDataKeys(0):
+            v = reader.GetMetaData(0, k)
+            logger.debug(f'({k}) = = "{v}"')
+        # dicom default: x is + to left, y is + posterior, z is + superior (https://dicom.innolitics.com/ciods/ct-image/image-plane/00200037)
+        if self.data_patient_orientation:
+            image = sitk.DICOMOrient(image, self.data_patient_orientation)
         arr = sitk.GetArrayFromImage(image)
         self.voxel_size = image.GetSpacing()
         self.grid_shape = image.GetSize()
@@ -588,12 +597,24 @@ if __name__ == '__main__':
         parameters = yaml.safe_load(f)
 
     # dicom_data = load_dicom_file(dicom_dir)
-    dicom_data = DicomScan(dicom_dir)
+    # todo add the option of loading image from different sources (nrrds, h5, etc)
+    dicom_data = DicomScan(dicom_dir, data_orientation='LPS')
     if tetmesh_file.suffix == '.cdb':
         tetmesh = load_cdb_archive(str(tetmesh_file)).grid
     else:
         tetmesh = pv.read(tetmesh_file)
         tetmesh = tetmesh.extract_cells_by_type(pv.CellType.TETRA)
-    # todo add the option of loading image from different sources (nrrds, h5, etc)
-    mesh = FeaMesh(tetmesh, dicom_data, parameters)
-    write_ansys_inp_file(mesh, output_tetmesh)
+    tf = np.array(
+        '1.000000 0.000000 0.000000 141.066692 0.000000 1.000000 0.000000 7.536217 0.000000 0.000000 1.000000 -46.385058 0.000000 0.000000 0.000000 1.000000'.split(
+            ' ')).astype(float).reshape((-1, 4))
+    inverted_tf = np.linalg.inv(tf)
+    untransformed_tetmesh = tetmesh.transform(inverted_tf, inplace=False)
+    pv.global_theme.color_cycler = 'default'
+    pl = pv.Plotter()
+    pl.add_volume(dicom_data, cmap='bone', opacity=[0, 0, 0, 0.0, 0.3, 0.6, 1])
+    pl.add_mesh(tetmesh)
+    pl.add_mesh(untransformed_tetmesh)
+    pl.show()
+
+    # mesh = FeaMesh(untransformed_tetmesh, dicom_data, parameters)
+    # write_ansys_inp_file(mesh, output_tetmesh)
